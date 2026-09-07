@@ -450,11 +450,11 @@ def _render_lines(lines: Sequence[TextLine], *, join_wrapped_lines: bool) -> str
             new_list_item
             or (
                 prev_ends_sentences
+                and (
+                    indented
+                    or vertical_gap > typical_height * 0.9
+                )
             )
-            and {
-                indented
-                or vertical_gap > typical_height * 0.9
-            }
         )
         if new_paragraph:
             chunks.append("\n" + line.text)
