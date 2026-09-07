@@ -14,9 +14,9 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from extract_arp4754_item import extract_reference as extract_arp4754_reference
-from extract_std_rs_item import extract_reference as extract_std_reference
-from extract_do297_reference import extract_reference as extract_do297_reference
+from extract_arp import extract_reference as extract_arp4754_reference
+from extract_std import extract_reference as extract_std_reference
+from extract_do import extract_reference as extract_do297_reference
 
 
 Extractor = Callable[..., Any]
@@ -278,7 +278,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--do297-pdf", type=Path, required=True)
     parser.add_argument("--arp4754-password")
     parser.add_argument("--std-password")
-    parser.add_argument("--do297-password")
+    parser.add_argument("--do297-password", default="912hyx4")
     parser.add_argument(
         "--join-wrapped-lines",
         action=argparse.BooleanOptionalAction,
