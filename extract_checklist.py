@@ -71,6 +71,7 @@ class ChecklistRecord:
     description: str | None
     reference_raw: str | None
     references: list[dict[str, str]]
+    reference_unparsed: list[str]
     applicability: str | None
 
 
@@ -78,7 +79,9 @@ REFERENCE_RE = re.compile(
     r"(?ix)"
     r"(?P<arp>\bARP\s*4754[A-Z]?\s+"
     r"(?P<arp_section>\d+(?:\.\d+)+)"
-    r"(?:\s+(?P<arp_item>[a-z](?:\(\d+\))?)(?![a-z0-9(]))?)"
+    r"(?:\s+(?P<arp_item>[a-z])"
+    r"(?P<arp_subitems>(?:\s*\(\d+\)(?:\s*,?\s*\(\d+\))*)?)"
+    r"(?![a-z0-9(]))?)"
     r"|"
     r"(?P<std>\bENG[\s-]*STD[\s-]*011\s+RS[\s-]*"
     r"(?P<std_number>\d+))"
@@ -86,6 +89,15 @@ REFERENCE_RE = re.compile(
     r"(?P<do>\bDO[\s-]*297\s+"
     r"(?P<do_section>\d+(?:\.\d+)+)"
     r"(?:\s+(?P<do_item>[a-z])(?![a-z0-9(]))?)"
+)
+
+REFERENCE_FILLER_RE = re.compile(
+    r"(?ix)^"
+    r"(?:"
+    r"\s+|[,;:/&+\-\u2013\u2014]+|"
+    r"\b(?:and/or|and|or|see|also|refer(?:ring)?\s+to)\b"
+    r")*"
+    r"$"
 )
 
 
@@ -101,44 +113,84 @@ def _normalize_header(value: object) -> str:
     return re.sub(r"\s+", " ", text).casefold()
 
 
-def parse_references(reference_raw: str | None) -> list[dict[str, str]]:
-    """Find and canonicalize supported references while preserving their order."""
+def parse_reference_cell(
+    reference_raw: str | None,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Return parsed references and nontrivial unmatched source fragments."""
     if not reference_raw:
-        return []
+        return [], []
 
     parsed: list[ParsedReference] = []
     seen: set[str] = set()
-    for match in REFERENCE_RE.finditer(reference_raw):
+    matches = list(REFERENCE_RE.finditer(reference_raw))
+    for match in matches:
         if match.group("arp"):
             section = match.group("arp_section")
             item = match.group("arp_item")
-            target = section + (f" {item.lower()}" if item else "")
-            result = ParsedReference(
-                document="ARP4754",
-                target=target,
-                canonical=f"ARP4754 {target}",
-            )
+            subitems = re.findall(r"\((\d+)\)", match.group("arp_subitems") or "")
+            if item and subitems:
+                targets = [
+                    f"{section} {item.lower()}({subitem})"
+                    for subitem in subitems
+                ]
+            else:
+                targets = [section + (f" {item.lower()}" if item else "")]
+            results = [
+                ParsedReference(
+                    document="ARP4754",
+                    target=target,
+                    canonical=f"ARP4754 {target}",
+                )
+                for target in targets
+            ]
         elif match.group("std"):
             target = f"RS{int(match.group('std_number'))}"
-            result = ParsedReference(
-                document="ENG-STD-011",
-                target=target,
-                canonical=f"ENG-STD-011 {target}",
-            )
+            results = [
+                ParsedReference(
+                    document="ENG-STD-011",
+                    target=target,
+                    canonical=f"ENG-STD-011 {target}",
+                )
+            ]
         else:
             section = match.group("do_section")
             item = match.group("do_item")
             target = section + (f" {item.lower()}" if item else "")
-            result = ParsedReference(
-                document="DO-297",
-                target=target,
-                canonical=f"DO-297 {target}",
-            )
+            results = [
+                ParsedReference(
+                    document="DO-297",
+                    target=target,
+                    canonical=f"DO-297 {target}",
+                )
+            ]
 
-        if result.canonical not in seen:
-            parsed.append(result)
-            seen.add(result.canonical)
-    return [asdict(reference) for reference in parsed]
+        for result in results:
+            if result.canonical not in seen:
+                parsed.append(result)
+                seen.add(result.canonical)
+
+    unparsed: list[str] = []
+    cursor = 0
+    for match in matches:
+        fragment = reference_raw[cursor:match.start()]
+        if fragment and not REFERENCE_FILLER_RE.fullmatch(fragment):
+            cleaned = fragment.strip(" \t\r\n,;:/&+-\u2013\u2014")
+            if cleaned:
+                unparsed.append(cleaned)
+        cursor = match.end()
+    fragment = reference_raw[cursor:]
+    if fragment and not REFERENCE_FILLER_RE.fullmatch(fragment):
+        cleaned = fragment.strip(" \t\r\n,;:/&+-\u2013\u2014")
+        if cleaned:
+            unparsed.append(cleaned)
+
+    return [asdict(reference) for reference in parsed], unparsed
+
+
+def parse_references(reference_raw: str | None) -> list[dict[str, str]]:
+    """Find and canonicalize supported references while preserving their order."""
+    references, _unparsed = parse_reference_cell(reference_raw)
+    return references
 
 
 def _resolve_sheet(workbook, expected_name: str) -> Worksheet:
@@ -214,6 +266,7 @@ def _extract_sheet_records(
 
         is_title = "." not in number
         parent_number = None if is_title else number.split(".", 1)[0]
+        references, reference_unparsed = parse_reference_cell(values[3])
         raw_records.append(
             ChecklistRecord(
                 source_file=source_file,
@@ -227,7 +280,8 @@ def _extract_sheet_records(
                 list_value=values[1],
                 description=values[2],
                 reference_raw=values[3],
-                references=parse_references(values[3]),
+                references=references,
+                reference_unparsed=reference_unparsed,
                 applicability=values[4],
             )
         )
