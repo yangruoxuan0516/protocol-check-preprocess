@@ -34,7 +34,7 @@ EXPECTED_HEADERS = (
     "Number",
     "List Value",
     "Description",
-    "Reference",
+    "References",
     "Applicability",
     "Pass/Fail",
     "Comments",
