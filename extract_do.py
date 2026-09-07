@@ -26,10 +26,11 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import fitz  # PyMuPDF
-
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 
 DEFAULT_TOP_MARGIN = 0.07
-DEFAULT_BOTTOM_MARGIN = 0.07
+DEFAULT_BOTTOM_MARGIN = 0.06
 DEFAULT_COLUMN_TOLERANCE = 0.025
 DEFAULT_HEADING_GAP = 0.012
 DEFAULT_ITEM_GAP = 0.010
@@ -38,7 +39,11 @@ DEFAULT_ITEM_GAP = 0.010
 class ReferenceExtractionError(RuntimeError):
     """Raised when the requested section or item cannot be located safely."""
 
-
+@dataclass(frozen=True)
+class ContentFlags:
+    contains_table: bool | None
+    contains_image: bool
+    
 @dataclass(frozen=True)
 class ParsedReference:
     original: str
@@ -133,7 +138,7 @@ class ExtractionResult:
     pdf_pages: list[int]
     page_labels: list[str]
     next_boundary: str | None
-
+    content_flags: ContentFlags
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -155,7 +160,65 @@ LIST_MARKER_RE = re.compile(
 )
 SENTENCE_END_RE = re.compile(r"[.!?][\"'\u201d\u2019)\]]*$")
 
+def _detect_content_flags(
+    doc: fitz.Document,
+    rows: Sequence[TextRow],
+    selected_start: int,
+    selected_end: int,
+    *,
+    top_margin_ratio: float,
+    bottom_margin_ratio: float,
+) -> ContentFlags:
+    """Detect tables and raster images intersecting the selected region."""
+    if selected_start >= selected_end or not rows:
+        return ContentFlags(contains_table=False, contains_image=False)
 
+    start_row = rows[selected_start]
+    boundary = rows[selected_end] if selected_end < len(rows) else None
+    end_page = boundary.page_index if boundary else rows[-1].page_index
+    contains_table: bool | None = False
+    contains_image = False
+
+    for page_index in range(start_row.page_index, end_page + 1):
+        page = doc[page_index]
+        region_top = page.rect.height * top_margin_ratio
+        region_bottom = page.rect.height * (1.0 - bottom_margin_ratio)
+        if page_index == start_row.page_index:
+            region_top = max(region_top, start_row.y0)
+        if boundary is not None and page_index == boundary.page_index:
+            region_bottom = min(region_bottom, boundary.y0)
+        if region_bottom <= region_top:
+            continue
+
+        if not contains_image:
+            for block in page.get_text("dict", sort=True).get("blocks", []):
+                if block.get("type") != 1:
+                    continue
+                _x0, y0, _x1, y1 = map(
+                    float, block.get("bbox", (0, 0, 0, 0))
+                )
+                if y1 > region_top and y0 < region_bottom:
+                    contains_image = True
+                    break
+
+        if contains_table is not True:
+            try:
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    tables = page.find_tables().tables
+                if any(
+                    float(table.bbox[3]) > region_top
+                    and float(table.bbox[1]) < region_bottom
+                    for table in tables
+                ):
+                    contains_table = True
+            except (AttributeError, RuntimeError, ValueError):
+                contains_table = None
+
+    return ContentFlags(
+        contains_table=contains_table,
+        contains_image=contains_image,
+    )
+    
 def parse_reference(reference: str) -> ParsedReference:
     """Parse ``3.1``, ``5.3 e`` or the same values prefixed by DO-297."""
     match = REFERENCE_RE.fullmatch(reference)
@@ -509,6 +572,14 @@ def extract_reference(
             minimum_heading_gap=minimum_heading_gap,
         )
         selected_start, selected_end = section_start, section_end
+        content_flags = _detect_content_flags(
+            doc,
+            rows,  # DO 脚本中是 rows
+            selected_start,
+            selected_end,
+            top_margin_ratio=top_margin_ratio,
+            bottom_margin_ratio=bottom_margin_ratio,
+        )
         next_boundary = next_section
         if parsed.item is not None:
             selected_start, selected_end, next_item = _find_item_bounds(
@@ -532,6 +603,7 @@ def extract_reference(
             ),
             page_labels=list(dict.fromkeys(row.page_label for row in selected)),
             next_boundary=next_boundary,
+            content_flags=content_flags,
         )
     finally:
         doc.close()
@@ -762,7 +834,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("pdf", type=Path, help="path to the DO-297 PDF")
     parser.add_argument("reference", help='e.g. "3.1" or "5.3 e"')
-    parser.add_argument("--password", help="PDF password, if required")
+    parser.add_argument("--password", default="912hyx4", help="PDF password, if required")
     parser.add_argument(
         "--top-margin",
         type=float,

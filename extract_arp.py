@@ -27,10 +27,16 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import fitz  # PyMuPDF
-
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 
 class ReferenceExtractionError(RuntimeError):
     """Raised when the requested section or item cannot be located safely."""
+
+@dataclass(frozen=True)
+class ContentFlags:
+    contains_table: bool | None
+    contains_image: bool
 
 
 @dataclass(frozen=True)
@@ -78,7 +84,7 @@ class ExtractionResult:
     text: str
     pdf_pages: list[int]     # one-based physical PDF page numbers
     page_labels: list[str]   # labels printed / defined by the PDF, if present
-
+    content_flags: ContentFlags
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -99,7 +105,67 @@ CHILD_ITEM_RE = re.compile(
     re.IGNORECASE,
 )
 
+def _detect_content_flags(
+    doc: fitz.Document,
+    lines: Sequence[TextLine],
+    selected_start: int,
+    selected_end: int,
+    *,
+    top_margin_ratio: float,
+    bottom_margin_ratio: float,
+) -> ContentFlags:
+    """Detect tables and raster images intersecting the selected item region."""
+    if selected_start >= selected_end or not lines:
+        return ContentFlags(contains_table=False, contains_image=False)
 
+    start_line = lines[selected_start]
+    boundary = lines[selected_end] if selected_end < len(lines) else None
+    end_page = boundary.page_index if boundary else lines[-1].page_index
+    contains_table: bool | None = False
+    contains_image = False
+
+    for page_index in range(start_line.page_index, end_page + 1):
+        page = doc[page_index]
+        region_top = page.rect.height * top_margin_ratio
+        region_bottom = page.rect.height * (1.0 - bottom_margin_ratio)
+        if page_index == start_line.page_index:
+            region_top = max(region_top, start_line.y0)
+        if boundary is not None and page_index == boundary.page_index:
+            region_bottom = min(region_bottom, boundary.y0)
+        if region_bottom <= region_top:
+            continue
+
+        if not contains_image:
+            for block in page.get_text("dict", sort=True).get("blocks", []):
+                if block.get("type") != 1:
+                    continue
+                _x0, y0, _x1, y1 = map(
+                    float, block.get("bbox", (0, 0, 0, 0))
+                )
+                if y1 > region_top and y0 < region_bottom:
+                    contains_image = True
+                    break
+
+        if contains_table is not True:
+            try:
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    tables = page.find_tables().tables
+                if any(
+                    float(table.bbox[3]) > region_top
+                    and float(table.bbox[1]) < region_bottom
+                    for table in tables
+                ):
+                    contains_table = True
+            except (AttributeError, RuntimeError, ValueError):
+                # ``None`` means this PyMuPDF build could not perform table
+                # detection; it is different from a confirmed ``False``.
+                contains_table = None
+
+    return ContentFlags(
+        contains_table=contains_table,
+        contains_image=contains_image,
+    )
+    
 def parse_reference(reference: str) -> ParsedReference:
     """Parse ``5.4.4.1 a`` or ``5.4.3 a(8)``; ARP4754 is optional."""
     match = REFERENCE_RE.fullmatch(reference)
@@ -433,8 +499,8 @@ def inspect_margins(
     reference: str,
     *,
     password: str | None = None,
-    top_margin_ratio: float = 0.07,
-    bottom_margin_ratio: float = 0.07,
+    top_margin_ratio: float = 0.05,
+    bottom_margin_ratio: float = 0.03,
     inspection_band: float = 0.20,
 ) -> dict:
     """Show which edge lines current margins keep/filter and suggest cutoffs."""
@@ -572,8 +638,8 @@ def extract_reference(
     reference: str,
     *,
     password: str | None = None,
-    top_margin_ratio: float = 0.07,
-    bottom_margin_ratio: float = 0.07,
+    top_margin_ratio: float = 0.05,
+    bottom_margin_ratio: float = 0.03,
     indent_tolerance_ratio: float = 0.03,
     join_wrapped_lines: bool = False,
 ) -> ExtractionResult:
@@ -614,6 +680,14 @@ def extract_reference(
             indent_tolerance_ratio=indent_tolerance_ratio,
         )
         selected_start, selected_end = item_start, item_end
+        content_flags = _detect_content_flags(
+            doc,
+            lines,  # DO 脚本中是 rows
+            selected_start,
+            selected_end,
+            top_margin_ratio=top_margin_ratio,
+            bottom_margin_ratio=bottom_margin_ratio,
+        )
         if parsed.subitem is not None:
             selected_start, selected_end = _find_numeric_subitem_bounds(
                 lines,
@@ -633,6 +707,7 @@ def extract_reference(
             text=_render_lines(selected, join_wrapped_lines=join_wrapped_lines),
             pdf_pages=pages,
             page_labels=labels,
+            content_flags=content_flags,
         )
     finally:
         doc.close()
@@ -654,14 +729,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--top-margin",
         type=float,
-        default=0.07,
-        help="fraction of page height ignored at top (default: 0.07)",
+        default=0.05,
+        help="fraction of page height ignored at top (default: 0.05)",
     )
     parser.add_argument(
         "--bottom-margin",
         type=float,
-        default=0.07,
-        help="fraction of page height ignored at bottom (default: 0.07)",
+        default=0.03,
+        help="fraction of page height ignored at bottom (default: 0.03)",
     )
     parser.add_argument(
         "--indent-tolerance",

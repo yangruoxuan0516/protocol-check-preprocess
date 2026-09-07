@@ -25,17 +25,22 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import fitz  # PyMuPDF
-
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 
 DEFAULT_TOP_MARGIN = 0.07
-DEFAULT_BOTTOM_MARGIN = 0.07
+DEFAULT_BOTTOM_MARGIN = 0.09
 DEFAULT_MARKER_COLUMN_TOLERANCE = 0.025
 
 
 class ReferenceExtractionError(RuntimeError):
     """Raised when an RS item cannot be located safely."""
 
-
+@dataclass(frozen=True)
+class ContentFlags:
+    contains_table: bool | None
+    contains_image: bool
+    
 @dataclass(frozen=True)
 class ParsedReference:
     original: str
@@ -90,7 +95,7 @@ class ExtractionResult:
     pdf_pages: list[int]
     page_labels: list[str]
     next_reference: str | None
-
+    content_flags: ContentFlags
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -108,8 +113,75 @@ LIST_MARKER_RE = re.compile(
     r"[\u2022\u25cf\u25aa\u2013\u2014])\s+",
     re.IGNORECASE,
 )
+SECTION_HEADING_RE = re.compile(
+    r"^\s*(?P<number>\d+(?:\.\d+)+)\.?(?=\s|$)",
+    re.IGNORECASE,
+)
 
+CHAPTER_HEADING_RE = re.compile(
+    r"^\s*CHAPTER\s+(?P<number>\d+)\b",
+    re.IGNORECASE,
+)
 
+def _detect_content_flags(
+    doc: fitz.Document,
+    lines: Sequence[TextLine],
+    selected_start: int,
+    selected_end: int,
+    *,
+    top_margin_ratio: float,
+    bottom_margin_ratio: float,
+) -> ContentFlags:
+    """Detect tables and raster images intersecting the selected RS region."""
+    if selected_start >= selected_end or not lines:
+        return ContentFlags(contains_table=False, contains_image=False)
+
+    start_line = lines[selected_start]
+    boundary = lines[selected_end] if selected_end < len(lines) else None
+    end_page = boundary.page_index if boundary else lines[-1].page_index
+    contains_table: bool | None = False
+    contains_image = False
+
+    for page_index in range(start_line.page_index, end_page + 1):
+        page = doc[page_index]
+        region_top = page.rect.height * top_margin_ratio
+        region_bottom = page.rect.height * (1.0 - bottom_margin_ratio)
+        if page_index == start_line.page_index:
+            region_top = max(region_top, start_line.y0)
+        if boundary is not None and page_index == boundary.page_index:
+            region_bottom = min(region_bottom, boundary.y0)
+        if region_bottom <= region_top:
+            continue
+
+        if not contains_image:
+            for block in page.get_text("dict", sort=True).get("blocks", []):
+                if block.get("type") != 1:
+                    continue
+                _x0, y0, _x1, y1 = map(
+                    float, block.get("bbox", (0, 0, 0, 0))
+                )
+                if y1 > region_top and y0 < region_bottom:
+                    contains_image = True
+                    break
+
+        if contains_table is not True:
+            try:
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    tables = page.find_tables().tables
+                if any(
+                    float(table.bbox[3]) > region_top
+                    and float(table.bbox[1]) < region_bottom
+                    for table in tables
+                ):
+                    contains_table = True
+            except (AttributeError, RuntimeError, ValueError):
+                contains_table = None
+
+    return ContentFlags(
+        contains_table=contains_table,
+        contains_image=contains_image,
+    )
+    
 def parse_reference(reference: str) -> ParsedReference:
     """Parse ``RS36`` or ``ENG-STD-011 RS36``."""
     match = REFERENCE_RE.fullmatch(reference)
@@ -273,6 +345,16 @@ def _rs_marker_number(text: str) -> int | None:
     match = RS_MARKER_RE.match(text)
     return int(match.group("number")) if match else None
 
+def _section_heading_label(text: str) -> str | None:
+    match = SECTION_HEADING_RE.match(text)
+    if match:
+        return match.group("number")
+
+    match = CHAPTER_HEADING_RE.match(text)
+    if match:
+        return f"CHAPTER {match.group('number')}"
+
+    return None
 
 def _marker_candidates(
     lines: Sequence[TextLine], *, require_bold: bool
@@ -331,6 +413,19 @@ def _find_item_bounds(
             end_index = candidate.line_index
             next_number = candidate.number
             break
+    for index in range(start_index + 1, end_index):
+        line = lines[index]
+
+        is_section_heading = (
+            line.leading_bold
+            and _section_heading_label(line.text) is not None
+            and line.x_ratio <= marker_x + marker_column_tolerance
+        )
+
+        if is_section_heading:
+            end_index = index
+            next_number = None
+            break
     return start_index, end_index, next_number
 
 
@@ -347,10 +442,19 @@ def _render_lines(lines: Sequence[TextLine], *, join_wrapped_lines: bool) -> str
         page_changed = line.page_index != previous.page_index
         vertical_gap = line.y0 - previous.y1 if not page_changed else 0.0
         indented = line.x_ratio > previous.x_ratio + 0.018
+        prev_ends_sentences = bool(
+            re.search(r'[.!?]["”’)\]]*$', previous.text.rstrip())
+        )
+        new_list_item = bool(LIST_MARKER_RE.match(line.text))
         new_paragraph = (
-            bool(LIST_MARKER_RE.match(line.text))
-            or indented
-            or vertical_gap > typical_height * 0.9
+            new_list_item
+            or (
+                prev_ends_sentences
+            )
+            and {
+                indented
+                or vertical_gap > typical_height * 0.9
+            }
         )
         if new_paragraph:
             chunks.append("\n" + line.text)
@@ -403,6 +507,14 @@ def extract_reference(
             require_bold=require_bold,
             marker_column_tolerance=marker_column_tolerance,
         )
+        content_flags = _detect_content_flags(
+            doc,
+            lines,
+            start,
+            end,
+            top_margin_ratio=top_margin_ratio,
+            bottom_margin_ratio=bottom_margin_ratio,
+        )
         selected = lines[start:end]
         return ExtractionResult(
             reference=parsed.canonical,
@@ -412,6 +524,7 @@ def extract_reference(
             ),
             page_labels=list(dict.fromkeys(line.page_label for line in selected)),
             next_reference=f"RS{next_number}" if next_number is not None else None,
+            content_flags=content_flags,
         )
     finally:
         doc.close()
@@ -635,6 +748,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--join-wrapped-lines",
         action="store_true",
+        default=True,
         help="join visual PDF line wraps while preserving detected list items",
     )
     parser.add_argument(
