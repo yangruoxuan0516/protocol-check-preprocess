@@ -159,6 +159,7 @@ def extract_records(
     records: List[Dict[str, Any]] = []
     warnings: List[str] = []
     seen_ids: Set[str] = set()
+    current_section_number: Optional[str] = None
 
     for table_index, table in enumerate(document.tables, start=1):
         for row_index, row in enumerate(table.rows, start=1):
@@ -186,6 +187,13 @@ def extract_records(
             nio_id = nio_id.upper()
             req = canonical_req(req_text)
             record_type = classify_record(specification)
+
+            if record_type == "section_header":
+                current_section_number = get_section_number(
+                    specification
+                )
+
+            section_number = current_section_number
 
             row_errors: List[str] = []
 
@@ -221,10 +229,11 @@ def extract_records(
             records.append(
                 {
                     "id": nio_id,
+                    "type": record_type,
+                    "section_number": section_number,
                     "specification": specification,
                     "rationale": rationale or None,
                     "req": req,
-                    "type": record_type,
                     "source": {
                         "file": docx_path.name,
                         "table": table_index,
