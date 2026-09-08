@@ -504,12 +504,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--output-dir",
+        "-o",
+        "--output",
         type=Path,
         default=None,
         help=(
-            "Output directory "
-            "(default: next to the input document)"
+            "Path to the output JSONL file "
+            "(default: <document_stem>_records.jsonl next to input document)"
         ),
     )
 
@@ -550,19 +551,18 @@ def main() -> int:
         )
         return 2
 
-    if args.output_dir is not None:
-        output_dir = args.output_dir.expanduser().resolve()
-    else:
-        output_dir = docx_path.parent
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     records, extraction_warnings = extract_records(docx_path)
 
     section_warnings = validate_section_headers(records)
 
-    base_name = docx_path.stem
-    jsonl_path = output_dir / "{}_records.jsonl".format(base_name)
+    if args.output is not None:
+        jsonl_path = args.output.expanduser().resolve()
+    else:
+        jsonl_path = docx_path.parent / "{}_records.jsonl".format(
+            docx_path.stem
+        )
+
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
     write_jsonl(records, jsonl_path)
 
