@@ -28,3 +28,12 @@ python extract_std.py "xxx.pdf" "RS36" --inspect-margins
 *enrich_checklist_with_reference.py*
 python enrich_checklist_with_reference.py "checklist.jsonl" --arp4754-pdf "xxx.pdf" --std-pdf "xxx.pdf" --do297-pdf "xxx.pdf" -o "enriched_checklist.jsonl"
 
+
+*extract_arinc.py*
+python extract_arinc.py "xxx.pdf" --inspect-margins
+
+python extract_arinc.py "xxx.pdf" --inspect-sections
+
+python extract_arinc.py ARINC664P2.pdf --document-id ARINC664P2 -o arinc664p2_chunks.jsonl
+
+python extract_arinc.py ARINC664P7.pdf --document-id ARINC664P7 -o arinc664p7_chunks.jsonl
