@@ -193,6 +193,7 @@ class HeadingCandidate:
     score: float = 0.0
     evidence: Tuple[str, ...] = ()
     kind: str = "numeric"
+    source_typo: Optional[str] = None
 
 
 @dataclass
@@ -289,6 +290,44 @@ def _title_similarity(a: str, b: str) -> float:
 
 def _section_tuple(number: str) -> Tuple[int, ...]:
     return tuple(int(part) for part in number.split("."))
+
+
+def _repair_missing_dot_section_number(
+    number: str,
+    title: str,
+    toc_evidence: Dict[str, List[str]],
+    bookmark_numeric: Dict[str, List[Tuple[str, int]]],
+) -> Tuple[str, str, Optional[str]]:
+    """Repair a source heading like ``4.7.2 2 Title`` conservatively.
+
+    A repair is made only when the first title token is an integer and the
+    resulting dotted number (for example ``4.7.2.2``) is corroborated by the
+    document's visible TOC and/or PDF bookmarks with a reasonably similar
+    title.  This is intended for obvious source/PDF numbering typos, not as a
+    general rewrite rule.
+    """
+    match = re.match(r"^(?P<child>\d+)\s+(?P<rest>\S.*)$", title)
+    if not match:
+        return number, title, None
+
+    repaired = number + "." + match.group("child")
+    repaired_title = _clean_text(match.group("rest"))
+    supporting_titles: List[str] = []
+    supporting_titles.extend(toc_evidence.get(repaired, []))
+    supporting_titles.extend(
+        item[0] for item in bookmark_numeric.get(repaired, [])
+    )
+    if not supporting_titles:
+        return number, title, None
+
+    best_similarity = max(
+        (_title_similarity(repaired_title, item) for item in supporting_titles),
+        default=0.0,
+    )
+    if best_similarity < 0.35:
+        return number, title, None
+
+    return repaired, repaired_title, number + " " + match.group("child")
 
 
 def _bbox_union(boxes: Sequence[Tuple[float, float, float, float]]) -> Tuple[float, float, float, float]:
@@ -1080,6 +1119,11 @@ def _heading_candidates_on_page(
         if not number or not title:
             continue
 
+        source_typo: Optional[str] = None
+        number, title, source_typo = _repair_missing_dot_section_number(
+            number, title, toc_evidence, bookmark_numeric
+        )
+
         # A TOC-like leader line should never become a body heading.
         if re.search(r"\.{3,}\s*\d+\s*$", title):
             continue
@@ -1112,6 +1156,12 @@ def _heading_candidates_on_page(
         bold = any(line.bold for line in selected_lines)
         x_ratio = bbox[0] / page_data.width if page_data.width else 0.0
         y_ratio = ((bbox[1] + bbox[3]) / 2.0) / page_data.height if page_data.height else 0.0
+
+        # ARINC body section headings are anchored in the left text column.
+        # Without TOC/bookmark corroboration, reject centered/right-side bold
+        # numbers such as labels embedded in figures or diagrams.
+        if not has_evidence and x_ratio > 0.20:
+            continue
 
         score = 0.0
         evidence_names: List[str] = []
@@ -1157,6 +1207,7 @@ def _heading_candidates_on_page(
                 score=score,
                 evidence=tuple(evidence_names),
                 kind="numeric",
+                source_typo=source_typo,
             )
         )
 
@@ -1236,11 +1287,20 @@ def _detect_headings(
     toc_evidence: Dict[str, List[str]],
     bookmark_numeric: Dict[str, List[Tuple[str, int]]],
     warnings: WarningCollector,
-) -> Tuple[List[HeadingCandidate], Set[Tuple[int, int, int]], Optional[int]]:
+) -> Tuple[
+    List[HeadingCandidate],
+    Set[Tuple[int, int, int]],
+    Optional[int],
+    Optional[Tuple[int, float]],
+]:
     navigation_pages = [page.page_index for page in pages if page.is_navigation]
     earliest_body_candidate = max(navigation_pages) + 1 if navigation_pages else 0
 
-    raw_candidates: List[HeadingCandidate] = []
+    # First identify reliable ATTACHMENT / APPENDIX boundaries.  Numeric
+    # numbering inside those regions belongs to a different namespace and is
+    # deliberately not promoted to document-level ARINC sections in v0.
+    appendix_candidates: List[HeadingCandidate] = []
+    page_candidate_lines: Dict[int, List[TextLine]] = {}
     for page in pages:
         if page.page_index < earliest_body_candidate or page.is_navigation:
             continue
@@ -1261,15 +1321,55 @@ def _detect_headings(
                 figure_caption_keys=figure_keys,
             )
         ]
-        raw_candidates.extend(
-            _heading_candidates_on_page(
-                page,
-                candidate_lines,
-                body_font,
-                toc_evidence,
-                bookmark_numeric,
-            )
+        page_candidate_lines[page.page_index] = candidate_lines
+        appendix_candidates.extend(
+            _appendix_candidates_on_page(page, candidate_lines, body_font)
         )
+
+    appendix_candidates.sort(key=lambda item: (item.page_index, item.y0, item.x0))
+    first_appendix_position: Optional[Tuple[int, float]] = None
+    if appendix_candidates:
+        first_appendix_position = (
+            appendix_candidates[0].page_index,
+            appendix_candidates[0].y0,
+        )
+
+    # Only bookmarks pointing to the main numeric body may corroborate numeric
+    # headings.  Repeated numbers inside attachments/appendices must not leak
+    # back into the main body namespace.
+    main_bookmark_numeric: Dict[str, List[Tuple[str, int]]] = {}
+    for number, entries in bookmark_numeric.items():
+        kept: List[Tuple[str, int]] = []
+        for title, page_index in entries:
+            if first_appendix_position is None:
+                kept.append((title, page_index))
+            elif page_index < first_appendix_position[0]:
+                kept.append((title, page_index))
+        if kept:
+            main_bookmark_numeric[number] = kept
+
+    raw_candidates: List[HeadingCandidate] = []
+    for page in pages:
+        if page.page_index < earliest_body_candidate or page.is_navigation:
+            continue
+        candidate_lines = page_candidate_lines.get(page.page_index, [])
+        numeric_candidates = _heading_candidates_on_page(
+            page,
+            candidate_lines,
+            body_font,
+            toc_evidence,
+            main_bookmark_numeric,
+        )
+        for candidate in numeric_candidates:
+            if first_appendix_position is not None:
+                if candidate.page_index > first_appendix_position[0]:
+                    continue
+                if (
+                    candidate.page_index == first_appendix_position[0]
+                    and candidate.y0 >= first_appendix_position[1]
+                ):
+                    continue
+            raw_candidates.append(candidate)
 
     accepted_numeric = [candidate for candidate in raw_candidates if candidate.score >= 4.0]
     accepted_numeric.sort(key=lambda item: (item.page_index, item.y0, item.x0))
@@ -1315,6 +1415,16 @@ def _detect_headings(
             except ValueError:
                 pass
 
+        if candidate.source_typo:
+            warnings.add(
+                'PDF %d: probable source numbering typo "%s" was normalized to section %s using TOC/bookmark evidence.'
+                % (
+                    candidate.page_index + 1,
+                    candidate.source_typo,
+                    candidate.section_number,
+                )
+            )
+
         if not candidate.evidence and candidate.score < 4.75:
             warnings.add(
                 "PDF %d: section %s was accepted mainly from layout/style rather than TOC/bookmark corroboration."
@@ -1327,56 +1437,69 @@ def _detect_headings(
 
     first_numeric_page = min((item.page_index for item in deduped), default=None)
 
-    # Appendices / attachments are deliberately handled only after the real body
-    # has begun.  Their deeper internal structures vary and are not inferred.
-    appendix_candidates: List[HeadingCandidate] = []
-    if first_numeric_page is not None:
-        for page in pages:
-            if page.page_index < first_numeric_page or page.is_navigation:
-                continue
-            figure_keys: Set[Tuple[int, int, int]] = set()
-            for caption in page.figure_captions:
-                figure_keys.update(caption.line_keys)
-            candidate_lines = [
-                line
-                for line in page.lines
-                if not _line_is_excluded_from_heading(
-                    line,
-                    repeated_keys=repeated_keys | duplicate_running_keys,
-                    top_margin_ratio=top_margin_ratio,
-                    bottom_margin_ratio=bottom_margin_ratio,
-                    body_font=body_font,
-                    table_regions=page.tables,
-                    image_regions=page.images,
-                    figure_caption_keys=figure_keys,
-                )
-            ]
-            appendix_candidates.extend(
-                _appendix_candidates_on_page(page, candidate_lines, body_font)
-            )
+    # Keep one enclosing heading per attachment/appendix identifier.  Repeated
+    # page-top labels for the same attachment/appendix are treated as running
+    # text and removed from body prose.
+    deduped_appendices: List[HeadingCandidate] = []
+    seen_appendix_keys: Dict[str, HeadingCandidate] = {}
+    for candidate in appendix_candidates:
+        if first_numeric_page is not None and candidate.page_index < first_numeric_page:
+            continue
+        match = APPENDIX_RE.match(candidate.section_title)
+        if not match:
+            continue
+        namespace_key = "%s %s" % (
+            match.group("kind").upper(),
+            match.group("identifier").upper(),
+        )
+        existing = seen_appendix_keys.get(namespace_key)
+        if existing is not None:
+            duplicate_running_keys.update(candidate.line_keys)
+            continue
+        seen_appendix_keys[namespace_key] = candidate
+        deduped_appendices.append(candidate)
 
-    all_headings = deduped + appendix_candidates
+    all_headings = deduped + deduped_appendices
     all_headings.sort(key=lambda item: (item.page_index, item.y0, item.x0))
-    return all_headings, duplicate_running_keys, first_numeric_page
-
+    return (
+        all_headings,
+        duplicate_running_keys,
+        first_numeric_page,
+        first_appendix_position,
+    )
 
 def _warn_bookmark_disagreement(
     headings: Sequence[HeadingCandidate],
     bookmark_numeric: Dict[str, List[Tuple[str, int]]],
     warnings: WarningCollector,
+    first_appendix_position: Optional[Tuple[int, float]],
 ) -> None:
     if not bookmark_numeric:
         return
+
     body_by_number = {
         heading.section_number: heading
         for heading in headings
         if heading.section_number is not None
     }
-    for number, entries in bookmark_numeric.items():
+    for number, all_entries in bookmark_numeric.items():
+        if first_appendix_position is None:
+            entries = list(all_entries)
+        else:
+            entries = [
+                (title, page_index)
+                for title, page_index in all_entries
+                if page_index < first_appendix_position[0]
+            ]
+        if not entries:
+            # Numeric bookmarks inside ATTACHMENT / APPENDIX namespaces are
+            # intentionally outside the main-body disagreement check.
+            continue
+
         heading = body_by_number.get(number)
         if heading is None:
             warnings.add(
-                "Bookmark/body-heading disagreement: bookmark section %s was not detected as a body heading."
+                "Bookmark/body-heading disagreement: bookmark section %s was not detected as a main-body heading."
                 % number
             )
             continue
@@ -1386,13 +1509,13 @@ def _warn_bookmark_disagreement(
         )
         if best_title_similarity < 0.35:
             warnings.add(
-                "Bookmark/body-heading disagreement: section %s title differs substantially from bookmark title."
+                "Bookmark/body-heading disagreement: main-body section %s title differs substantially from bookmark title."
                 % number
             )
         nearest_page = min(abs(heading.page_index - page_index) for _title, page_index in entries)
         if nearest_page > 2:
             warnings.add(
-                "Bookmark/body-heading disagreement: section %s body heading is %d physical pages away from its nearest bookmark target."
+                "Bookmark/body-heading disagreement: main-body section %s body heading is %d physical pages away from its nearest bookmark target."
                 % (number, nearest_page)
             )
 
@@ -1927,6 +2050,7 @@ class AnalysisResult:
     repeated_keys: Set[Tuple[int, int, int]]
     duplicate_running_keys: Set[Tuple[int, int, int]]
     first_numeric_page: Optional[int]
+    first_appendix_position: Optional[Tuple[int, float]]
     body_font: float
     warnings: WarningCollector
 
@@ -2004,7 +2128,12 @@ def _analyze_document(
             page_data, usable, warnings
         )
 
-    headings, duplicate_running_keys, first_numeric_page = _detect_headings(
+    (
+        headings,
+        duplicate_running_keys,
+        first_numeric_page,
+        first_appendix_position,
+    ) = _detect_headings(
         pages,
         repeated_keys=repeated_keys,
         top_margin_ratio=top_margin_ratio,
@@ -2014,7 +2143,9 @@ def _analyze_document(
         bookmark_numeric=bookmark_numeric,
         warnings=warnings,
     )
-    _warn_bookmark_disagreement(headings, bookmark_numeric, warnings)
+    _warn_bookmark_disagreement(
+        headings, bookmark_numeric, warnings, first_appendix_position
+    )
 
     if first_numeric_page is None:
         warnings.add(
@@ -2027,6 +2158,7 @@ def _analyze_document(
         repeated_keys=repeated_keys,
         duplicate_running_keys=duplicate_running_keys,
         first_numeric_page=first_numeric_page,
+        first_appendix_position=first_appendix_position,
         body_font=body_font,
         warnings=warnings,
     )
@@ -2210,7 +2342,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--top-margin",
         type=float,
-        default=0.04,
+        default=0.09,
         help="fraction of page height removed geometrically at top (default: 0.04)",
     )
     parser.add_argument(
