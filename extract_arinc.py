@@ -190,8 +190,10 @@ class HeadingCandidate:
     y1: float
     font_size: float
     bold: bool
+    x_ratio: float = 0.0
     score: float = 0.0
     evidence: Tuple[str, ...] = ()
+    evidence_similarity: float = 0.0
     kind: str = "numeric"
     source_typo: Optional[str] = None
 
@@ -1062,6 +1064,59 @@ def _line_is_excluded_from_heading(
     return False
 
 
+def _supporting_section_titles(
+    number: str,
+    toc_evidence: Dict[str, List[str]],
+    bookmark_numeric: Dict[str, List[Tuple[str, int]]],
+) -> List[str]:
+    titles: List[str] = []
+    titles.extend(toc_evidence.get(number, []))
+    titles.extend(item[0] for item in bookmark_numeric.get(number, []))
+    return titles
+
+
+def _section_evidence(
+    number: str,
+    title: str,
+    toc_evidence: Dict[str, List[str]],
+    bookmark_numeric: Dict[str, List[Tuple[str, int]]],
+    *,
+    similarity_threshold: float = 0.35,
+) -> Tuple[Tuple[str, ...], float]:
+    """Return strong external evidence labels and the best title similarity.
+
+    A matching section number alone is deliberately not treated as strong
+    corroboration.  This prevents figure labels such as ``2.4 Something`` from
+    becoming headings merely because section 2.4 exists elsewhere in the
+    document.  The title must also be reasonably similar to the TOC/bookmark
+    title.
+    """
+    evidence_names: List[str] = []
+    best_similarity = 0.0
+
+    toc_titles = toc_evidence.get(number, [])
+    if toc_titles:
+        toc_similarity = max(
+            (_title_similarity(title, item) for item in toc_titles),
+            default=0.0,
+        )
+        best_similarity = max(best_similarity, toc_similarity)
+        if toc_similarity >= similarity_threshold:
+            evidence_names.append("visible_toc")
+
+    bookmark_titles = bookmark_numeric.get(number, [])
+    if bookmark_titles:
+        bookmark_similarity = max(
+            (_title_similarity(title, item[0]) for item in bookmark_titles),
+            default=0.0,
+        )
+        best_similarity = max(best_similarity, bookmark_similarity)
+        if bookmark_similarity >= similarity_threshold:
+            evidence_names.append("bookmark")
+
+    return tuple(evidence_names), best_similarity
+
+
 def _heading_candidates_on_page(
     page_data: PageData,
     candidate_lines: Sequence[TextLine],
@@ -1085,7 +1140,7 @@ def _heading_candidates_on_page(
         selected_lines: List[TextLine] = []
 
         # Preferred case: a left numeric fragment and a title fragment share a
-        # visual row (e.g. "1.1" + "Purpose").
+        # visual row (for example, ``1.1`` + ``Purpose``).
         first_number = SECTION_NUMBER_ONLY_RE.match(row[0].text)
         if first_number and len(row) >= 2:
             number = first_number.group("number")
@@ -1098,18 +1153,25 @@ def _heading_candidates_on_page(
                 title = _clean_text(direct.group("title"))
                 selected_lines = list(row)
             elif first_number and len(row) == 1:
-                # Rare split-row heading: number on one line, title immediately
+                # Rare split-row heading: number on one line and title just
                 # below.  Require strong heading-like style.
                 if row_index + 1 < len(rows):
                     next_row = sorted(rows[row_index + 1], key=lambda item: item.x0)
                     gap = min(item.y0 for item in next_row) - max(item.y1 for item in row)
                     next_text = _clean_text(" ".join(item.text for item in next_row))
+                    next_x_ratio = (
+                        min(item.x0 for item in next_row) / page_data.width
+                        if page_data.width
+                        else 0.0
+                    )
                     if (
                         next_text
                         and gap <= max(4.0, row[0].height * 0.65)
                         and any(item.bold for item in next_row)
+                        and next_x_ratio <= 0.20
                         and not SECTION_ROW_RE.match(next_text)
                         and not SECTION_NUMBER_ONLY_RE.match(next_text)
+                        and not APPENDIX_RE.match(next_text)
                     ):
                         number = first_number.group("number")
                         title = next_text
@@ -1118,6 +1180,52 @@ def _heading_candidates_on_page(
 
         if not number or not title:
             continue
+
+        # Source typo special case: some ARINC PDFs contain a heading such as
+        # ``4.7.2 2`` with the title on the next visual row, where the intended
+        # number is clearly ``4.7.2.2``.  Only consume that next row when the
+        # repaired number and the next-row title are corroborated by the
+        # visible TOC and/or PDF bookmarks.
+        if re.fullmatch(r"\d+", title) and row_index + 1 < len(rows):
+            child = title
+            repaired_number = number + "." + child
+            next_row = sorted(rows[row_index + 1], key=lambda item: item.x0)
+            next_text = _clean_text(" ".join(item.text for item in next_row))
+            support_titles = _supporting_section_titles(
+                repaired_number, toc_evidence, bookmark_numeric
+            )
+            next_similarity = max(
+                (_title_similarity(next_text, item) for item in support_titles),
+                default=0.0,
+            )
+            next_x_ratio = (
+                min(item.x0 for item in next_row) / page_data.width
+                if next_row and page_data.width
+                else 1.0
+            )
+            gap = (
+                min(item.y0 for item in next_row) - max(item.y1 for item in selected_lines)
+                if next_row and selected_lines
+                else math.inf
+            )
+            next_style_ok = bool(next_row) and (
+                any(item.bold for item in next_row)
+                or max(item.font_size for item in next_row) >= body_font - 0.25
+            )
+            if (
+                support_titles
+                and next_text
+                and next_similarity >= 0.35
+                and next_x_ratio <= 0.20
+                and gap <= max(5.0, statistics.median([item.height for item in selected_lines]) * 0.90)
+                and next_style_ok
+                and not SECTION_ROW_RE.match(next_text)
+                and not SECTION_NUMBER_ONLY_RE.match(next_text)
+                and not APPENDIX_RE.match(next_text)
+            ):
+                selected_lines.extend(next_row)
+                title = child + " " + next_text
+                used_rows.add(row_index + 1)
 
         source_typo: Optional[str] = None
         number, title, source_typo = _repair_missing_dot_section_number(
@@ -1128,17 +1236,29 @@ def _heading_candidates_on_page(
         if re.search(r"\.{3,}\s*\d+\s*$", title):
             continue
 
-        # If the heading is corroborated by the visible TOC/bookmarks, allow a
-        # wrapped bold title line immediately below to be included.
-        has_evidence = number in toc_evidence or number in bookmark_numeric
-        if has_evidence and selected_lines and row_index + 1 < len(rows) and (row_index + 1) not in used_rows:
+        evidence_names, evidence_similarity = _section_evidence(
+            number, title, toc_evidence, bookmark_numeric
+        )
+        has_strong_evidence = bool(evidence_names)
+
+        # If strongly corroborated, allow one wrapped bold title row just below
+        # the first heading row.  Number-only evidence is not sufficient.
+        if (
+            has_strong_evidence
+            and selected_lines
+            and row_index + 1 < len(rows)
+            and (row_index + 1) not in used_rows
+        ):
             next_row = sorted(rows[row_index + 1], key=lambda item: item.x0)
             next_text = _clean_text(" ".join(item.text for item in next_row))
             gap = min(item.y0 for item in next_row) - max(item.y1 for item in selected_lines)
             title_x0 = min(item.x0 for item in selected_lines[1:] or selected_lines)
             if (
                 next_text
-                and gap <= max(3.0, statistics.median([item.height for item in selected_lines]) * 0.55)
+                and gap <= max(
+                    3.0,
+                    statistics.median([item.height for item in selected_lines]) * 0.55,
+                )
                 and all(item.bold for item in next_row)
                 and min(item.x0 for item in next_row) >= title_x0 - page_data.width * 0.03
                 and min(item.x0 for item in next_row) <= page_data.width * 0.20
@@ -1146,50 +1266,60 @@ def _heading_candidates_on_page(
                 and not SECTION_NUMBER_ONLY_RE.match(next_text)
                 and not APPENDIX_RE.match(next_text)
             ):
-                selected_lines.extend(next_row)
-                title = _clean_text(title + " " + next_text)
-                used_rows.add(row_index + 1)
+                proposed_title = _clean_text(title + " " + next_text)
+                proposed_evidence, proposed_similarity = _section_evidence(
+                    number, proposed_title, toc_evidence, bookmark_numeric
+                )
+                if proposed_evidence:
+                    selected_lines.extend(next_row)
+                    title = proposed_title
+                    evidence_names = proposed_evidence
+                    evidence_similarity = proposed_similarity
+                    used_rows.add(row_index + 1)
 
         boxes = [(line.x0, line.y0, line.x1, line.y1) for line in selected_lines]
         bbox = _bbox_union(boxes)
         font_size = max(line.font_size for line in selected_lines)
         bold = any(line.bold for line in selected_lines)
         x_ratio = bbox[0] / page_data.width if page_data.width else 0.0
-        y_ratio = ((bbox[1] + bbox[3]) / 2.0) / page_data.height if page_data.height else 0.0
+        y_ratio = (
+            ((bbox[1] + bbox[3]) / 2.0) / page_data.height
+            if page_data.height
+            else 0.0
+        )
 
-        # ARINC body section headings are anchored in the left text column.
-        # Without TOC/bookmark corroboration, reject centered/right-side bold
-        # numbers such as labels embedded in figures or diagrams.
-        if not has_evidence and x_ratio > 0.20:
+        # Numeric ARINC body headings are anchored in the leftmost fifth of the
+        # page.  Treat this as a hard geometric requirement, even if the same
+        # section number exists in a TOC/bookmark.  This blocks bold labels
+        # embedded inside figures and diagrams farther to the right.
+        if x_ratio > 0.20:
+            continue
+
+        # Bare integer labels (``1``, ``2``, ``3``) are common inside figures.
+        # ARINC main-body top-level headings are normally ``1.0``, ``2.0``, ...
+        # so a bare integer is accepted only when its title is strongly
+        # corroborated by the TOC/bookmarks.
+        if "." not in number and not has_strong_evidence:
             continue
 
         score = 0.0
-        evidence_names: List[str] = []
         if bold:
             score += 2.0
         if font_size >= body_font - 0.25:
             score += 1.0
         if x_ratio <= 0.20:
             score += 1.0
-        if number in toc_evidence:
+        if "visible_toc" in evidence_names:
             score += 3.0
-            evidence_names.append("visible_toc")
-            if max((_title_similarity(title, item) for item in toc_evidence[number]), default=0.0) >= 0.45:
-                score += 0.5
-        if number in bookmark_numeric:
+        if "bookmark" in evidence_names:
             score += 3.0
-            evidence_names.append("bookmark")
-            if max((_title_similarity(title, item[0]) for item in bookmark_numeric[number]), default=0.0) >= 0.45:
-                score += 0.5
+        if evidence_similarity >= 0.60:
+            score += 0.5
         if title.isupper() and len(title) <= 120:
             score += 0.25
         if y_ratio < 0.095 and font_size < body_font - 0.5:
             score -= 2.0
         if len(title) > 220:
-            score -= 1.5
-        if "." not in number and not has_evidence:
-            # Plain integers are common list markers; accept only with stronger
-            # external/layout evidence.
             score -= 1.5
 
         candidates.append(
@@ -1204,15 +1334,16 @@ def _heading_candidates_on_page(
                 y1=bbox[3],
                 font_size=font_size,
                 bold=bold,
+                x_ratio=x_ratio,
                 score=score,
-                evidence=tuple(evidence_names),
+                evidence=evidence_names,
+                evidence_similarity=evidence_similarity,
                 kind="numeric",
                 source_typo=source_typo,
             )
         )
 
     return candidates
-
 
 def _appendix_candidates_on_page(
     page_data: PageData,
@@ -1269,9 +1400,10 @@ def _appendix_candidates_on_page(
                 y1=bbox[3],
                 font_size=font_size,
                 bold=bold,
+                x_ratio=x_ratio,
                 score=4.0,
                 evidence=(),
-                kind="appendix",
+                kind=match.group("kind").lower(),
             )
         )
     return result
@@ -1336,7 +1468,10 @@ def _detect_headings(
 
     # Only bookmarks pointing to the main numeric body may corroborate numeric
     # headings.  Repeated numbers inside attachments/appendices must not leak
-    # back into the main body namespace.
+    # back into the main-body namespace.  A numeric bookmark on the exact page
+    # where the first ATTACHMENT/APPENDIX begins is kept only when the visible
+    # main TOC also knows that section number; this avoids using appendix-local
+    # bookmark numbers as body evidence.
     main_bookmark_numeric: Dict[str, List[Tuple[str, int]]] = {}
     for number, entries in bookmark_numeric.items():
         kept: List[Tuple[str, int]] = []
@@ -1344,6 +1479,11 @@ def _detect_headings(
             if first_appendix_position is None:
                 kept.append((title, page_index))
             elif page_index < first_appendix_position[0]:
+                kept.append((title, page_index))
+            elif (
+                page_index == first_appendix_position[0]
+                and number in toc_evidence
+            ):
                 kept.append((title, page_index))
         if kept:
             main_bookmark_numeric[number] = kept
@@ -1371,7 +1511,34 @@ def _detect_headings(
                     continue
             raw_candidates.append(candidate)
 
-    accepted_numeric = [candidate for candidate in raw_candidates if candidate.score >= 4.0]
+    # Learn the left-column anchor from strongly corroborated main-body
+    # headings.  Layout-only candidates must sit close to that anchor.  This is
+    # stricter than the absolute leftmost-fifth rule and filters bold numeric
+    # labels inside figures even when they are still technically left of 20%.
+    corroborated_x = [
+        candidate.x_ratio
+        for candidate in raw_candidates
+        if candidate.evidence
+        and candidate.score >= 4.0
+        and candidate.x_ratio <= 0.20
+    ]
+    layout_heading_x_cutoff = 0.20
+    if len(corroborated_x) >= 3:
+        anchor = statistics.median(corroborated_x)
+        deviations = [abs(value - anchor) for value in corroborated_x]
+        mad = statistics.median(deviations) if deviations else 0.0
+        adaptive_tolerance = max(0.025, min(0.050, 0.020 + 3.0 * mad))
+        layout_heading_x_cutoff = min(
+            0.20,
+            max(0.12, anchor + adaptive_tolerance),
+        )
+
+    accepted_numeric = [
+        candidate
+        for candidate in raw_candidates
+        if candidate.score >= 4.0
+        and (candidate.evidence or candidate.x_ratio <= layout_heading_x_cutoff)
+    ]
     accepted_numeric.sort(key=lambda item: (item.page_index, item.y0, item.x0))
 
     duplicate_running_keys: Set[Tuple[int, int, int]] = set()
@@ -1483,20 +1650,27 @@ def _warn_bookmark_disagreement(
         if heading.section_number is not None
     }
     for number, all_entries in bookmark_numeric.items():
+        heading = body_by_number.get(number)
         if first_appendix_position is None:
             entries = list(all_entries)
         else:
-            entries = [
-                (title, page_index)
-                for title, page_index in all_entries
-                if page_index < first_appendix_position[0]
-            ]
+            entries = []
+            for title, page_index in all_entries:
+                if page_index < first_appendix_position[0]:
+                    entries.append((title, page_index))
+                    continue
+                if (
+                    page_index == first_appendix_position[0]
+                    and heading is not None
+                    and heading.page_index == first_appendix_position[0]
+                    and heading.y0 < first_appendix_position[1]
+                ):
+                    entries.append((title, page_index))
         if not entries:
             # Numeric bookmarks inside ATTACHMENT / APPENDIX namespaces are
             # intentionally outside the main-body disagreement check.
             continue
 
-        heading = body_by_number.get(number)
         if heading is None:
             warnings.add(
                 "Bookmark/body-heading disagreement: bookmark section %s was not detected as a main-body heading."
